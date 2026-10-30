@@ -1,0 +1,581 @@
+
+
+########## FILE: .github/workflows/build.yml ##########
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - run: gradle :app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LensTranslate-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+
+########## FILE: app/build.gradle.kts ##########
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "app.lenstranslate"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "app.lenstranslate"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+    buildFeatures { compose = true }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+    implementation(composeBom)
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+    implementation("com.google.mlkit:translate:17.0.3")
+    implementation("com.google.mlkit:language-id:17.0.6")
+
+    implementation("com.android.billingclient:billing-ktx:7.1.1")
+
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+}
+
+
+########## FILE: app/src/main/AndroidManifest.xml ##########
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="com.android.vending.BILLING" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/ic_menu_search"
+        android:label="LensTranslate"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".overlay.BubbleService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="floating_translation_overlay" />
+        </service>
+
+        <service
+            android:name=".extract.AccessibilityExtractor"
+            android:exported="true"
+            android:label="LensTranslate"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+
+        <service
+            android:name=".tile.HideTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_menu_search"
+            android:label="LensTranslate"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".overlay.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+
+
+########## FILE: app/src/main/java/app/lenstranslate/core/AppSettings.kt ##########
+package app.lenstranslate.core
+
+import android.content.Context
+import android.content.SharedPreferences
+
+class AppSettings(context: Context) {
+    private val p: SharedPreferences =
+        context.applicationContext.getSharedPreferences("lenstranslate", Context.MODE_PRIVATE)
+
+    private fun putInt(k: String, v: Int) = p.edit().putInt(k, v).apply()
+    private fun putBool(k: String, v: Boolean) = p.edit().putBoolean(k, v).apply()
+
+    // ---- الحالة ----
+    var bubbleEnabled: Boolean
+        get() = p.getBoolean("enabled", false)
+        set(v) = putBool("enabled", v)
+    var bubbleHidden: Boolean
+        get() = p.getBoolean("hidden", false)
+        set(v) = putBool("hidden", v)
+    var autoStartOnBoot: Boolean
+        get() = p.getBoolean("boot", true)
+        set(v) = putBool("boot", v)
+
+    // ---- Pro ----
+    var isPro: Boolean
+        get() = p.getBoolean("pro", false)
+        set(v) = putBool("pro", v)
+
+    // ---- الأيقونة (مجاني) ----
+    var idleTimeoutSec: Int
+        get() = p.getInt("idle_timeout", 4).coerceIn(2, 10)
+        set(v) = putInt("idle_timeout", v)
+    var sizeDp: Int
+        get() = p.getInt("size_dp", 52).coerceIn(36, 80)
+        set(v) = putInt("size_dp", v)
+    var lockPosition: Boolean
+        get() = p.getBoolean("lock", false)
+        set(v) = putBool("lock", v)
+    var hideWhileTranslating: Boolean
+        get() = p.getBoolean("hide_while", true)
+        set(v) = putBool("hide_while", v)
+
+    // ---- الشفافية: القيم المخصصة لـ Pro فقط ----
+    private var rawIdleOpacity: Int
+        get() = p.getInt("op_idle", 60)
+        set(v) = putInt("op_idle", v)
+    private var rawActiveOpacity: Int
+        get() = p.getInt("op_active", 12)
+        set(v) = putInt("op_active", v)
+    var idleOpacity: Int
+        get() = if (isPro) rawIdleOpacity.coerceIn(20, 100) else 60
+        set(v) { rawIdleOpacity = v }
+    var activeOpacity: Int
+        get() = if (isPro) rawActiveOpacity.coerceIn(5, 40) else 12
+        set(v) { rawActiveOpacity = v }
+
+    // ---- الحفظ ----
+    var volumeSave: Boolean
+        get() = p.getBoolean("vol_save", true)
+        set(v) = putBool("vol_save", v)
+    var saveFormat: SaveFormat
+        get() = runCatching { SaveFormat.valueOf(p.getString("save_fmt", "IMAGE")!!) }
+            .getOrDefault(SaveFormat.IMAGE)
+        set(v) { p.edit().putString("save_fmt", v.name).apply() }
+
+    // ---- موضع الأيقونة (لكل تطبيق) ----
+    fun getPos(pkg: String?): BubblePos {
+        val s = pkg?.let { p.getString("pos_$it", null) }
+            ?: p.getString("pos_global", null)
+            ?: return BubblePos(true, 0.4f)
+        val parts = s.split(",")
+        return BubblePos(parts[0] == "R", parts.getOrNull(1)?.toFloatOrNull() ?: 0.4f)
+    }
+
+    fun savePos(pkg: String?, pos: BubblePos) {
+        val key = if (pkg == null) "pos_global" else "pos_$pkg"
+        p.edit().putString(key, (if (pos.right) "R" else "L") + "," + pos.yFrac).apply()
+    }
+
+    fun resetPositions() {
+        val e = p.edit()
+        p.all.keys.filter { it.startsWith("pos_") }.forEach { e.remove(it) }
+        e.apply()
+    }
+}
+
+
+########## FILE: app/src/main/java/app/lenstranslate/core/Models.kt ##########
+package app.lenstranslate.core
+
+import android.graphics.Rect
+
+enum class BubbleState { IDLE, ACTIVE, NEAR, BUSY, HIDDEN }
+
+enum class SaveFormat { IMAGE, PDF, ASK }
+
+data class BubblePos(val right: Boolean, val yFrac: Float)
+
+data class LangPair(val source: String?, val target: String)
+
+/** كتلة نص على الشاشة: الصندوق والنص وألوانه (لوضع الحرباء لاحقاً). */
+data class TextBlock(
+    val rect: Rect,
+    val text: String,
+    val bgColor: Int = 0,
+    val fgColor: Int = 0xFFFFFFFF.toInt(),
+    val rtl: Boolean = false
+)
+
+
+########## FILE: app/src/main/java/app/lenstranslate/core/Pipeline.kt ##########
+package app.lenstranslate.core
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
+
+interface TextExtractor {
+    fun extract(): List<TextBlock>
+}
+
+/** خط المعالجة: التقاط ← استخراج ← ترجمة ← عرض. يُستبدل في الخطوة 3. */
+interface TranslationPipeline {
+    /** يُستدعى عند ضغط الأيقونة؛ استدعِ onDone عند انتهاء العرض. */
+    fun run(context: Context, onDone: () -> Unit)
+
+    /** يحفظ آخر ترجمة كصورة أو PDF. */
+    fun saveLast(context: Context, format: SaveFormat)
+}
+
+object Pipeline {
+    @Volatile
+    var impl: TranslationPipeline = StubPipeline()
+}
+
+class StubPipeline : TranslationPipeline {
+    private val main = Handler(Looper.getMainLooper())
+
+    override fun run(context: Context, onDone: () -> Unit) {
+        main.post {
+            Toast.makeText(context, "الالتقاط والترجمة تُضافان في الخطوة 3", Toast.LENGTH_SHORT).show()
+        }
+        main.postDelayed({ onDone() }, 1200)
+    }
+
+    override fun saveLast(context: Context, format: SaveFormat) {
+        main.post {
+            Toast.makeText(context, "الحفظ (${format.name}) يُضاف لاحقاً", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+
+########## FILE: app/src/main/java/app/lenstranslate/extract/AccessibilityExtractor.kt ##########
+package app.lenstranslate.extract
+
+import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
+import android.os.SystemClock
+import android.view.KeyEvent
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import app.lenstranslate.core.AppSettings
+import app.lenstranslate.core.Pipeline
+import app.lenstranslate.core.TextBlock
+import app.lenstranslate.core.TextExtractor
+import app.lenstranslate.overlay.BubbleService
+
+/**
+ * ثلاث مهام خفيفة:
+ * 1) معرفة التطبيق الأمامي لتذكّر موضع الأيقونة لكل تطبيق.
+ * 2) قراءة نصوص الشاشة مباشرة (أسرع وأدق من OCR).
+ * 3) ضغط خفض الصوت مرتين لحفظ آخر ترجمة.
+ */
+class AccessibilityExtractor : AccessibilityService(), TextExtractor {
+
+    companion object {
+        @Volatile
+        var instance: AccessibilityExtractor? = null
+    }
+
+    private var lastVolDown = 0L
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onInterrupt() {}
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = rootInActiveWindow?.packageName?.toString() ?: return
+        if (pkg == packageName || pkg == "com.android.systemui") return
+        BubbleService.instance?.onForegroundChanged(pkg)
+    }
+
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN ||
+            event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0
+        ) return false
+        val settings = AppSettings(this)
+        if (!settings.volumeSave) return false
+        val now = SystemClock.uptimeMillis()
+        if (now - lastVolDown < 450) {
+            lastVolDown = 0
+            Pipeline.impl.saveLast(applicationContext, settings.saveFormat)
+            return true
+        }
+        lastVolDown = now
+        return false
+    }
+
+    override fun extract(): List<TextBlock> {
+        val root = rootInActiveWindow ?: return emptyList()
+        val out = ArrayList<TextBlock>()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val n = stack.removeLast()
+            if (n.isVisibleToUser && n.childCount == 0) {
+                val t = n.text?.toString() ?: n.contentDescription?.toString()
+                if (!t.isNullOrBlank()) {
+                    val r = Rect()
+                    n.getBoundsInScreen(r)
+                    if (!r.isEmpty) out.add(TextBlock(r, t.trim()))
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return out
+    }
+}
+
+
+########## FILE: app/src/main/java/app/lenstranslate/overlay/BootReceiver.kt ##########
+package app.lenstranslate.overlay
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.provider.Settings
+import app.lenstranslate.core.AppSettings
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val s = AppSettings(context)
+        if (s.autoStartOnBoot && s.bubbleEnabled && Settings.canDrawOverlays(context)) {
+            BubbleService.start(context)
+        }
+    }
+}
+
+
+########## FILE: app/src/main/java/app/lenstranslate/overlay/BubbleService.kt ##########
+package app.lenstranslate.overlay
+
+import android.animation.ValueAnimator
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.util.DisplayMetrics
+import android.view.ContextThemeWrapper
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.PopupMenu
+import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+import app.lenstranslate.core.AppSettings
+import app.lenstranslate.core.BubblePos
+import app.lenstranslate.core.BubbleState
+import app.lenstranslate.core.Pipeline
+import app.lenstranslate.ui.MainActivity
+
+class BubbleService : Service(), BubbleView.Listener {
+
+    companion object {
+        const val ACTION_SHOW = "app.lenstranslate.SHOW"
+        const val ACTION_HIDE = "app.lenstranslate.HIDE"
+        const val ACTION_STOP = "app.lenstranslate.STOP"
+        private const val CHANNEL = "lt_service"
+        private const val NOTIF_ID = 1
+
+        @Volatile
+        var instance: BubbleService? = null
+
+        fun start(ctx: Context, action: String? = null) {
+            val i = Intent(ctx, BubbleService::class.java).setAction(action)
+            ContextCompat.startForegroundService(ctx, i)
+        }
+    }
+
+    private lateinit var settings: AppSettings
+    private lateinit var wm: WindowManager
+    private lateinit var view: BubbleView
+    private lateinit var params: WindowManager.LayoutParams
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var added = false
+    private var rightSide = true
+    private var yFrac = 0.4f
+    private var currentPkg: String? = null
+    private var busy = false
+    private var dragging = false
+    private var touching = false
+    private var lastActivity = 0L
+
+    var hidden = false
+        private set
+
+    private val idleRunnable = Runnable {
+        if (!hidden && !busy && !dragging && !touching) view.setState(BubbleState.IDLE)
+    }
+    private val watchdog = Runnable { finishTranslation() }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        settings = AppSettings(this)
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        createChannel()
+
+        val themed = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_Light)
+        view = BubbleView(themed, settings).also { it.listener = this }
+        val sz = sizePx()
+        params = WindowManager.LayoutParams(
+            sz, sz,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+
+        loadPos(null)
+        applyPos(false)
+        hidden = settings.bubbleHidden
+        try {
+            wm.addView(view, params)
+            added = true
+        } catch (e: Exception) {
+            Toast.makeText(this, "فعّل إذن العرض فوق التطبيقات أولاً", Toast.LENGTH_LONG).show()
+            stopSelf()
+            return
+        }
+        view.dockSign = if (rightSide) 1 else -1
+        if (hidden) {
+            view.setState(BubbleState.HIDDEN)
+        } else {
+            view.setState(BubbleState.NEAR)
+            scheduleIdle()
+        }
+        settings.bubbleEnabled = true
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val type = when {
+            Build.VERSION.SDK_INT >= 34 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            Build.VERSION.SDK_INT >= 29 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST
+            else -> 0
+        }
+        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), type)
+        if (!added) return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_SHOW -> showBubble()
+            ACTION_HIDE -> hideBubble()
+            ACTION_STOP -> {
+                settings.bubbleEnabled = false
+                stopSelf()
+            }
+        }
+        return START_STICKY
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (added) applyPos(false)
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        if (added) {
+            try { wm.removeView(view) } catch (_: Exception) {}
+            added = false
+        }
+        instance = null
+        super.onDestroy()
+    }
+
+    // ---------- الإخفاء والإ
